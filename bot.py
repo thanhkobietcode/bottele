@@ -11,13 +11,13 @@ import re
 from pathlib import Path
 import zipfile
 from io import BytesIO
+import sys
 
 def _split_cookie_path(file_path):
     p = Path(file_path)
     return p.parent.name, p.name
 
 def _fast_print(msg):
-    import sys
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
@@ -28,10 +28,19 @@ try:
     from curl_cffi import requests as crequests
     HAS_CURL_CFFI = True
 except ImportError:
-    crequests = requests
-    HAS_CURL_CFFI = False
+    _fast_print("WARNING: curl_cffi not installed. Installing via pip...")
+    try:
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "curl_cffi"])
+        from curl_cffi import requests as crequests
+        HAS_CURL_CFFI = True
+        _fast_print("SUCCESS: curl_cffi installed successfully")
+    except Exception as e:
+        _fast_print(f"ERROR: Failed to install curl_cffi: {e}")
+        crequests = requests
+        HAS_CURL_CFFI = False
 
-CUSTOM_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0'
+CUSTOM_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
 def parse_cookies_txt(content):
     cookies = []
@@ -97,7 +106,6 @@ def extract_public_plan_info(plan_info):
     return text
 
 def clean_filename(text):
-    import re
     if not text or not text.strip():
         return "unnamed"
     invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*', '\x00']
@@ -121,6 +129,7 @@ def clean_filename(text):
 def test_cookies_with_target(cookies, target_url, contains_text):
     if not cookies:
         return {'status': 'no_cookies','message': 'No suitable cookies found for this domain'}
+    
     if 'roblox.com' in target_url.lower():
         return test_roblox_login(cookies)
     if 'instagram.com' in target_url.lower():
@@ -136,121 +145,82 @@ def test_cookies_with_target(cookies, target_url, contains_text):
     if 'capcut.com' in target_url.lower():
         return test_capcut_login(cookies)
     if 'facebook.com' in target_url.lower():
-        required_cookies = ['c_user', 'xs', 'datr', 'fr', 'sb']
+        required_cookies = ['c_user', 'xs']
         cookie_names = [cookie['name'] for cookie in cookies]
         missing_cookies = [cookie for cookie in required_cookies if cookie not in cookie_names]
         if missing_cookies:
             return {'status': 'no_cookies','message': f'Not enough Facebook cookies (missing: {", ".join(missing_cookies)})','final_url': target_url,'status_code': 200}
         else:
             return test_facebook_login(cookies)
+    
     try:
-        session = requests.Session()
+        session = crequests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
         for cookie in cookies:
             domain = cookie['domain'].lstrip('.')
             cookie_name = str(cookie['name'])[:100]
             cookie_value = str(cookie['value'])[:4000]
             session.cookies.set(cookie_name, cookie_value, domain=domain, path=cookie['path'], secure=cookie['secure'])
-        headers = {'User-Agent': CUSTOM_USER_AGENT}
-        response = session.get(target_url, headers=headers, timeout=15, allow_redirects=True)
-        if len(response.content) > 50 * 1024 * 1024:
-            return {'status': 'error','message': 'Response too large, skipping analysis','final_url': response.url,'status_code': response.status_code}
-        final_url = response.url
+        
+        headers = {
+            'User-Agent': CUSTOM_USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0'
+        }
+        
+        response = session.get(target_url, headers=headers, timeout=20, allow_redirects=True)
+        final_url = str(response.url)
         status_code = response.status_code
+        
         if 'login' in final_url.lower() or 'signin' in final_url.lower() or 'accounts.' in final_url.lower():
             return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code}
+        
         if status_code == 200:
-            if 'login' in final_url.lower() or 'signin' in final_url.lower() or 'accounts.' in final_url.lower():
-                return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code}
-            elif contains_text and contains_text.lower() in response.text.lower():
-                if 'tiktok.com' in target_url.lower():
-                    if 'tiktok.com/setting' in final_url.lower():
-                        username = extract_tiktok_username(response.text)
-                        if username:
-                            profile_result = test_tiktok_profile(cookies, username)
-                            if profile_result['status'] == 'success':
-                                stats = profile_result['stats']
-                                followers = stats['followers']
-                                following = stats['following']
-                                likes = stats['likes']
-                                videos = stats.get('videos', '0')
-                                verified = stats.get('verified', 'false')
-                                plan_info = f"User: {username} | Followers: {followers} | Following: {following} | Likes: {likes} | Videos: {videos}"
-                                if verified == 'true':
-                                    plan_info += " | Verified"
-                            else:
-                                plan_info = f"User: {username} | Profile: {profile_result['message']}"
+            if 'tiktok.com' in target_url.lower():
+                if 'tiktok.com/setting' in final_url.lower():
+                    username = extract_tiktok_username(response.text)
+                    if username:
+                        profile_result = test_tiktok_profile(cookies, username)
+                        if profile_result['status'] == 'success':
+                            stats = profile_result['stats']
+                            followers = stats['followers']
+                            following = stats['following']
+                            likes = stats['likes']
+                            videos = stats.get('videos', '0')
+                            verified = stats.get('verified', 'false')
+                            plan_info = f"User: {username} | Followers: {followers} | Following: {following} | Likes: {likes} | Videos: {videos}"
+                            if verified == 'true':
+                                plan_info += " | Verified"
                         else:
-                            plan_info = 'Status: LIVE'
-                        return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'plan_info': plan_info}
+                            plan_info = f"User: {username} | Profile: {profile_result['message']}"
                     else:
-                        return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
-                elif 'canva.com' in target_url.lower():
-                    canva_result = test_canva_login(cookies)
-                    return canva_result
-                plan_info = ""
-                if 'spotify.com' in target_url.lower():
-                    plan_info = extract_spotify_plan(response.text)
-                elif 'netflix.com' in target_url.lower():
-                    plan_info = extract_netflix_plan(response.text)
-                return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'plan_info': plan_info}
-            elif 'account' in final_url.lower() or 'overview' in final_url.lower() or 'membership' in final_url.lower() or 'billing' in final_url.lower():
-                if 'canva.com' in target_url.lower():
-                    canva_result = test_canva_login(cookies)
-                    return canva_result
-                plan_info = ""
-                if 'spotify.com' in target_url.lower():
-                    plan_info = extract_spotify_plan(response.text)
-                elif 'netflix.com' in target_url.lower():
-                    plan_info = extract_netflix_plan(response.text)
-                if 'netflix.com' in target_url.lower():
-                    if 'account' in final_url.lower() and 'membership' not in final_url.lower():
-                        return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': plan_info}
-                    elif "Unknown" in plan_info or "Not found" in plan_info:
-                        return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': plan_info}
-                return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'plan_info': plan_info}
-            else:
-                if 'tiktok.com' in target_url.lower():
-                    if 'tiktok.com/setting' in final_url.lower():
-                        username = extract_tiktok_username(response.text)
-                        if username:
-                            profile_result = test_tiktok_profile(cookies, username)
-                            if profile_result['status'] == 'success':
-                                stats = profile_result['stats']
-                                followers = stats['followers']
-                                following = stats['following']
-                                likes = stats['likes']
-                                videos = stats.get('videos', '0')
-                                verified = stats.get('verified', 'false')
-                                plan_info = f"User: {username} | Followers: {followers} | Following: {following} | Likes: {likes} | Videos: {videos}"
-                                if verified == 'true':
-                                    plan_info += " | Verified"
-                            else:
-                                plan_info = f"User: {username} | Profile: {profile_result['message']}"
-                        else:
-                            plan_info = 'Status: LIVE'
-                        return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'plan_info': plan_info}
-                    else:
-                        return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
-                elif 'facebook.com' in target_url.lower():
-                    facebook_result = test_facebook_login(cookies)
-                    return facebook_result
-                elif 'canva.com' in target_url.lower():
-                    canva_result = test_canva_login(cookies)
-                    return canva_result
+                        plan_info = 'Status: LIVE'
+                    return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'plan_info': plan_info}
                 else:
-                    return {'status': 'unknown','message': 'Cookie UNKNOWN','final_url': final_url,'status_code': status_code}
-        else:
-            if 'canva.com' in target_url.lower():
+                    return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
+            elif 'canva.com' in target_url.lower():
                 canva_result = test_canva_login(cookies)
                 return canva_result
+            
+            if 'account' in final_url.lower() or 'overview' in final_url.lower() or 'membership' in final_url.lower() or 'billing' in final_url.lower():
+                plan_info = ""
+                if 'spotify.com' in target_url.lower():
+                    plan_info = extract_spotify_plan(response.text)
+                elif 'netflix.com' in target_url.lower():
+                    plan_info = extract_netflix_plan(response.text)
+                return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'plan_info': plan_info}
             else:
-                return {'status': 'dead','message': f'Cookie DEAD - HTTP {status_code}','final_url': final_url,'status_code': status_code}
+                return {'status': 'unknown','message': 'Cookie UNKNOWN','final_url': final_url,'status_code': status_code}
+        else:
+            return {'status': 'dead','message': f'Cookie DEAD - HTTP {status_code}','final_url': final_url,'status_code': status_code}
     except Exception as e:
         return {'status': 'error','message': f'Error testing cookies: {str(e)}'}
 
 def extract_spotify_plan(html_content):
     try:
-        import re
         exact_plan_patterns = [
             r'<div[^>]*class="sc-15a2717d-5 gNnrac"[^>]*>.*?<span[^>]*class="[^"]*encore-text-title-medium[^"]*"[^>]*>([^<]+)</span>',
             r'<span[^>]*class="[^"]*encore-text-title-medium[^"]*"[^>]*>([^<]+)</span>',
@@ -278,34 +248,39 @@ def extract_spotify_plan(html_content):
         return f"Plan: Error when checking - {str(e)}"
 
 def test_netflix_login(cookies):
-    return test_cookies_with_target(cookies, "https://www.netflix.com/browse", "profiles")
+    return test_cookies_with_target(cookies, "https://www.netflix.com/account", "Account")
 
 def test_spotify_login(cookies):
-    return test_cookies_with_target(cookies, "https://www.spotify.com/account/overview/", "account")
+    return test_cookies_with_target(cookies, "https://www.spotify.com/account/overview/", "Overview")
 
 def test_tiktok_login(cookies):
-    return test_cookies_with_target(cookies, "https://www.tiktok.com/setting", "setting")
+    return test_cookies_with_target(cookies, "https://www.tiktok.com/setting", "Settings")
 
 def test_roblox_login(cookies):
     try:
-        session = requests.Session()
+        session = crequests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
         for cookie in cookies:
             domain = cookie['domain'].lstrip('.')
             cookie_name = str(cookie['name'])[:100]
             cookie_value = str(cookie['value'])[:4000]
             session.cookies.set(cookie_name, cookie_value, domain=domain, path=cookie['path'], secure=cookie['secure'])
-        headers = {'User-Agent': CUSTOM_USER_AGENT,'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8','Referer': 'https://www.roblox.com/'}
-        target_url = "https://www.roblox.com/vi/home"
-        response = session.get(target_url, headers=headers, timeout=30, allow_redirects=True)
-        final_url = response.url
+        
+        headers = {
+            'User-Agent': CUSTOM_USER_AGENT,
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.roblox.com/'
+        }
+        
+        target_url = "https://www.roblox.com/home"
+        response = session.get(target_url, headers=headers, timeout=20, allow_redirects=True)
+        final_url = str(response.url)
         status_code = response.status_code
+        
         if status_code == 200:
-            if '/vi/home' in final_url:
+            if '/home' in final_url and 'login' not in final_url.lower():
                 return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'plan_info': 'Status: LIVE'}
-            elif '/login' in final_url.lower() or '/vi/login' in final_url.lower():
-                return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
             else:
-                return {'status': 'unknown','message': 'Cookie UNKNOWN','final_url': final_url,'status_code': status_code,'plan_info': 'Status: UNKNOWN'}
+                return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
         else:
             return {'status': 'dead','message': f'Cookie DEAD - HTTP {status_code}','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
     except Exception as e:
@@ -313,24 +288,29 @@ def test_roblox_login(cookies):
 
 def test_instagram_login(cookies):
     try:
-        session = requests.Session()
+        session = crequests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
         for cookie in cookies:
             domain = cookie['domain'].lstrip('.')
             cookie_name = str(cookie['name'])[:100]
             cookie_value = str(cookie['value'])[:4000]
             session.cookies.set(cookie_name, cookie_value, domain=domain, path=cookie['path'], secure=cookie['secure'])
-        headers = {'User-Agent': CUSTOM_USER_AGENT,'Accept-Language': 'en-US,en;q=0.9','Referer': 'https://www.instagram.com/','X-Requested-With': 'XMLHttpRequest'}
+        
+        headers = {
+            'User-Agent': CUSTOM_USER_AGENT,
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.instagram.com/'
+        }
+        
         target_url = "https://www.instagram.com/accounts/edit/"
-        response = session.get(target_url, headers=headers, timeout=30, allow_redirects=True)
-        final_url = response.url
+        response = session.get(target_url, headers=headers, timeout=20, allow_redirects=True)
+        final_url = str(response.url)
         status_code = response.status_code
+        
         if status_code == 200:
             if '/accounts/edit/' in final_url:
                 return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'plan_info': 'Status: LIVE'}
-            elif '/accounts/login' in final_url.lower() or '/login' in final_url.lower():
-                return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
             else:
-                return {'status': 'unknown','message': 'Cookie UNKNOWN','final_url': final_url,'status_code': status_code,'plan_info': 'Status: UNKNOWN'}
+                return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
         else:
             return {'status': 'dead','message': f'Cookie DEAD - HTTP {status_code}','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
     except Exception as e:
@@ -338,7 +318,6 @@ def test_instagram_login(cookies):
 
 def extract_netflix_plan(html_content):
     try:
-        import re
         exact_plan_patterns = [
             r'<h3[^>]*data-uia="account-membership-page\+plan-card\+title"[^>]*class="[^"]*"[^>]*>([^<]+)</h3>',
             r'<h3[^>]*class="[^"]*"[^>]*>([^<]+)</h3>',
@@ -366,20 +345,16 @@ def extract_netflix_plan(html_content):
 
 def extract_tiktok_username(html_content):
     try:
-        import re
         pattern = r'"uniqueId":"([^"]+)"'
         matches = re.findall(pattern, html_content)
         if matches:
-            unique_usernames = list(set(matches))
-            if unique_usernames:
-                return unique_usernames[0]
+            return matches[0]
         return None
     except Exception:
         return None
 
 def extract_tiktok_profile_stats(html_content):
     try:
-        import re
         patterns = {
             'followers': r'"followerCount":(\d+)',
             'following': r'"followingCount":(\d+)',
@@ -391,23 +366,25 @@ def extract_tiktok_profile_stats(html_content):
         for key, pattern in patterns.items():
             match = re.search(pattern, html_content)
             stats[key] = match.group(1) if match else "0"
-        return {'followers': '0' if stats['followers'] is None else stats['followers'],'following': '0' if stats['following'] is None else stats['following'],'likes': '0' if stats['likes'] is None else stats['likes'],'videos': '0' if stats.get('videos') is None else stats.get('videos'),'verified': 'false' if stats.get('verified') is None else stats.get('verified')}
+        return stats
     except Exception:
         return {'followers': '0','following': '0','likes': '0','videos': '0','verified': 'false'}
 
 def test_tiktok_profile(cookies, username):
     try:
-        session = requests.Session()
+        session = crequests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
         for cookie in cookies:
             domain = cookie['domain'].lstrip('.')
             cookie_name = str(cookie['name'])[:100]
             cookie_value = str(cookie['value'])[:4000]
             session.cookies.set(cookie_name, cookie_value, domain=domain, path=cookie['path'], secure=cookie['secure'])
+        
         headers = {'User-Agent': CUSTOM_USER_AGENT}
         profile_url = f"https://www.tiktok.com/@{username}"
         response = session.get(profile_url, headers=headers, timeout=15, allow_redirects=True)
-        final_url = response.url
+        final_url = str(response.url)
         status_code = response.status_code
+        
         if status_code == 200 and f'@{username}' in final_url:
             stats = extract_tiktok_profile_stats(response.text)
             return {'status': 'success','stats': stats,'final_url': final_url,'status_code': status_code}
@@ -418,111 +395,72 @@ def test_tiktok_profile(cookies, username):
 
 def test_facebook_login(cookies):
     try:
-        session = requests.Session()
+        session = crequests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
         for cookie in cookies:
             domain = cookie['domain'].lstrip('.')
             cookie_name = str(cookie['name'])[:100]
             cookie_value = str(cookie['value'])[:4000]
             session.cookies.set(cookie_name, cookie_value, domain=domain, path=cookie['path'], secure=cookie['secure'])
-        headers = {'User-Agent': CUSTOM_USER_AGENT,'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8','Accept-Language': 'vi-VN,vi;q=0.8,en-US;q=0.5,en;q=0.3','Accept-Encoding': 'gzip, deflate, br, zstd','Connection': 'keep-alive','Upgrade-Insecure-Requests': '1','Sec-Fetch-Dest': 'document','Sec-Fetch-Mode': 'navigate','Sec-Fetch-Site': 'none'}
+        
+        headers = {
+            'User-Agent': CUSTOM_USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive'
+        }
+        
         facebook_url = "https://www.facebook.com/settings"
-        response = session.get(facebook_url, headers=headers, timeout=15, allow_redirects=True)
-        final_url = response.url
+        response = session.get(facebook_url, headers=headers, timeout=20, allow_redirects=True)
+        final_url = str(response.url)
         status_code = response.status_code
+        
         if status_code == 200:
             if 'facebook.com/settings' in final_url.lower():
                 return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'plan_info': 'Status: LIVE'}
             else:
                 return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
-        elif status_code == 400:
-            return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
         else:
-            return {'status': 'error','message': f'HTTP error: {status_code}','final_url': final_url,'status_code': status_code}
+            return {'status': 'dead','message': f'Cookie DEAD - HTTP {status_code}','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
     except Exception as e:
-        return {'status': 'error','message': f'Error testing Facebook: {str(e)}'}
+        return {'status': 'error','message': f'Error testing Facebook: {str(e)}','plan_info': 'Status: Error'}
 
 def test_canva_login(cookies):
     try:
-        if not HAS_CURL_CFFI:
-            return test_canva_login_fallback(cookies)
-        session = crequests.Session(impersonate="chrome")
+        session = crequests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
         session.headers.update({"User-Agent": CUSTOM_USER_AGENT})
         for cookie in cookies:
             domain = cookie['domain'].lstrip('.')
             cookie_name = str(cookie['name'])[:100]
             cookie_value = str(cookie['value'])[:4000]
             session.cookies.set(cookie_name, cookie_value, domain=domain, path=cookie['path'], secure=cookie['secure'])
+        
         settings_url = "https://www.canva.com/settings/"
         response = session.get(settings_url, timeout=30, allow_redirects=True)
-        if len(response.content) > 50 * 1024 * 1024:
-            return {'status': 'error','message': 'Response too large, skipping analysis','plan_info': 'Plan: Error'}
-        final_url = response.url
+        final_url = str(response.url)
         status_code = response.status_code
+        
         if status_code == 200:
             if 'canva.com/settings' in final_url.lower():
                 plan_info = "Plan: Unknown"
                 try:
                     billing_response = session.get("https://www.canva.com/settings/billing-and-teams", timeout=15)
-                    if billing_response.status_code == 200 and 'billing-and-teams' in billing_response.url.lower():
+                    if billing_response.status_code == 200:
                         plan_info = extract_canva_plan(billing_response.text)
-                        if plan_info == "Plan: Unknown - Could not detect plan type":
-                            plan_info = "Plan: Unknown"
-                    else:
-                        plan_info = "Plan: Unknown"
                 except Exception:
                     plan_info = "Plan: Unknown"
                 return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'plan_info': plan_info}
             else:
                 return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
-        elif status_code == 403:
-            return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
         else:
             return {'status': 'dead','message': f'Cookie DEAD - HTTP {status_code}','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
     except Exception as e:
         return {'status': 'error','message': f'Error testing Canva login: {str(e)}','plan_info': 'Status: Error'}
 
-def test_canva_login_fallback(cookies):
-    try:
-        session = requests.Session()
-        for cookie in cookies:
-            domain = cookie['domain'].lstrip('.')
-            cookie_name = str(cookie['name'])[:100]
-            cookie_value = str(cookie['value'])[:4000]
-            session.cookies.set(cookie_name, cookie_value, domain=domain, path=cookie['path'], secure=cookie['secure'])
-        headers = {'User-Agent': CUSTOM_USER_AGENT}
-        settings_url = "https://www.canva.com/settings/"
-        response = session.get(settings_url, headers=headers, timeout=15, allow_redirects=True)
-        if len(response.content) > 50 * 1024 * 1024:
-            return {'status': 'error','message': 'Response too large, skipping analysis (fallback)','plan_info': 'Plan: Error'}
-        final_url = response.url
-        status_code = response.status_code
-        if status_code == 200:
-            if 'canva.com/settings' in final_url.lower():
-                plan_info = "Plan: Unknown"
-                try:
-                    billing_response = session.get("https://www.canva.com/settings/billing-and-teams", headers=headers, timeout=15)
-                    if billing_response.status_code == 200 and 'billing-and-teams' in billing_response.url.lower():
-                        plan_info = extract_canva_plan(billing_response.text)
-                        if plan_info == "Plan: Unknown - Could not detect plan type":
-                            plan_info = "Plan: Unknown"
-                    else:
-                        plan_info = "Plan: Unknown"
-                except Exception:
-                    plan_info = "Plan: Unknown"
-                return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'plan_info': plan_info}
-            else:
-                return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
-        else:
-            return {'status': 'dead','message': f'Cookie DEAD - HTTP {status_code} (fallback)','final_url': final_url,'status_code': status_code,'plan_info': 'Status: DEAD'}
-    except Exception as e:
-        return {'status': 'error','message': f'Error testing Canva login (fallback): {str(e)}','plan_info': 'Status: Error'}
-
 def extract_canva_plan(html_content):
     try:
-        import re
         auto_plan_patterns = [
             r'<h4[^>]*class="[^"]*"[^>]*>([^<]+)</h4>',
-            r'<h[1-6][^>]*>([^<]*(?:plan|subscription|tier|account|membership|free|pro|premium|basic|business|enterprise|team|personal|plus|standard|advanced)[^<]*)</h[1-6]>',
             r'<div[^>]*class="[^"]*plan[^"]*"[^>]*>([^<]+)</div>',
             r'<div[^>]*class="[^"]*subscription[^"]*"[^>]*>([^<]+)</div>'
         ]
@@ -531,224 +469,207 @@ def extract_canva_plan(html_content):
             matches = re.findall(pattern, html_content, re.IGNORECASE | re.DOTALL)
             for match in matches:
                 plan_text = match.strip()
-                if len(plan_text) > 3 and len(plan_text) < 50:
-                    skip_words = ['button', 'menu', 'nav', 'header', 'footer', 'close', 'open', 'click', 'settings']
+                if 3 < len(plan_text) < 50:
+                    skip_words = ['button', 'menu', 'nav', 'header', 'footer']
                     if not any(skip in plan_text.lower() for skip in skip_words):
-                        plan_indicators = ['canva', 'pro', 'free', 'premium', 'basic', 'business', 'enterprise', 'team', 'personal', 'plus', 'standard', 'advanced']
+                        plan_indicators = ['pro', 'free', 'premium', 'basic', 'business', 'team']
                         if any(indicator in plan_text.lower() for indicator in plan_indicators):
                             detected_plans.append(plan_text)
+        
         if detected_plans:
-            best_plan = detected_plans[0]
-            payment_info = extract_payment_info(html_content)
-            if payment_info:
-                return f"Plan: {best_plan}{payment_info}"
-            return f"Plan: {best_plan}"
+            return f"Plan: {detected_plans[0]}"
         return "Plan: Unknown"
     except Exception as e:
         return f"Plan: Error - {str(e)}"
 
-def extract_payment_info(html_content):
-    try:
-        import re
-        auto_payment_patterns = [
-            r'([¥€£$₹¢₽₿]\d+[\d.,]*[^<]{0,15})',
-            r'(\d+[\d.,]*[^<]{0,5}[¥€£$₹¢₽₿][^<]{0,15})',
-            r'(\d+[\d.,]*\s*(?:USD|EUR|GBP|JPY|CNY|INR|CAD|AUD|CHF|SEK|NOK|DKK|PLN|CZK|HUF|BGN|RON|HRK|RUB|TRY|BRL|MXN|KRW|SGD|HKD|THB|VND|PHP|IDR|MYR)[^<]{0,15})',
-            r'(\d+[^<]{0,15}(?:month|year|annual|monthly|yearly)[^<]{0,10})',
-            r'((?:Visa|Mastercard|Master Card|American Express|Amex|Discover|PayPal|Apple Pay|Google Pay|Stripe|UnionPay)\s*[•*·]{0,10}\s*\d{4})',
-            r'(\d+(?:&nbsp;|\s)+[A-Z]{2,4}\$[^<]{0,15})',
-            r'(\d+(?:&nbsp;|\s)*[^<]{0,10}/(?:month|year)[^<]{0,10})'
-        ]
-        all_payment_info = []
-        for pattern in auto_payment_patterns:
-            matches = re.findall(pattern, html_content, re.IGNORECASE | re.DOTALL)
-            for match in matches:
-                payment_info = match.strip()
-                payment_info = payment_info.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-                if payment_info and len(payment_info) > 2:
-                    is_duplicate = False
-                    for existing in all_payment_info:
-                        if payment_info in existing or existing in payment_info:
-                            if len(payment_info) > len(existing):
-                                all_payment_info.remove(existing)
-                                all_payment_info.append(payment_info)
-                            is_duplicate = True
-                            break
-                    if not is_duplicate:
-                        all_payment_info.append(payment_info)
-        if all_payment_info:
-            return f" | {' · '.join(all_payment_info)}"
-        return ""
-    except Exception:
-        return ""
-
 def test_linkedin_login(cookies):
     try:
-        session = requests.Session()
+        session = crequests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
         for cookie in cookies:
             domain = cookie['domain'].lstrip('.')
             session.cookies.set(cookie['name'],cookie['value'],domain=domain,path=cookie['path'],secure=cookie['secure'])
-        headers = {'User-Agent': CUSTOM_USER_AGENT,'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8','Accept-Language': 'en-US,en;q=0.9','Referer': 'https://www.linkedin.com/','Connection': 'keep-alive','Upgrade-Insecure-Requests': '1'}
+        
+        headers = {
+            'User-Agent': CUSTOM_USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.linkedin.com/'
+        }
+        
         target_url = "https://www.linkedin.com/mypreferences/d/categories/account"
-        response = session.get(target_url, headers=headers, timeout=15, allow_redirects=False)
+        response = session.get(target_url, headers=headers, timeout=20, allow_redirects=False)
         status_code = response.status_code
-        final_url = response.url
+        final_url = str(response.url)
+        
         if status_code in [301, 302, 303, 307, 308]:
             redirect_location = response.headers.get('Location', '')
-            if '/uas/login' in redirect_location or '/login' in redirect_location:
+            if '/uas/login' in redirect_location:
                 return {'status': 'dead','message': 'Cookie DEAD','final_url': redirect_location,'status_code': status_code}
-        elif status_code == 200 and '/mypreferences/d/categories/account' in final_url:
+        elif status_code == 200:
             return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code}
         else:
             return {'status': 'unknown','message': 'Unexpected response','final_url': final_url,'status_code': status_code}
-    except requests.exceptions.Timeout:
-        return {'status': 'unknown','message': 'Timeout occurred while testing LinkedIn cookies','final_url': 'N/A','status_code': 'Timeout'}
     except Exception as e:
-        return {'status': 'unknown','message': f'Error testing LinkedIn login: {str(e)}','final_url': 'N/A','status_code': 'Error'}
+        return {'status': 'error','message': f'Error testing LinkedIn login: {str(e)}'}
 
 def test_amazon_login(cookies):
     try:
-        session = requests.Session()
+        session = crequests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
         for cookie in cookies:
             domain = cookie['domain'].lstrip('.')
             session.cookies.set(cookie['name'],cookie['value'],domain=domain,path=cookie['path'],secure=cookie['secure'])
-        headers = {'User-Agent': CUSTOM_USER_AGENT,'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8','Accept-Language': 'en-US,en;q=0.9','Referer': 'https://www.amazon.com/','Connection': 'keep-alive','Upgrade-Insecure-Requests': '1'}
-        target_url = "https://www.amazon.com/gp/your-account/order-history?ref_=ya_d_c_yo"
-        response = session.get(target_url, headers=headers, timeout=15, allow_redirects=False)
+        
+        headers = {
+            'User-Agent': CUSTOM_USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.amazon.com/'
+        }
+        
+        target_url = "https://www.amazon.com/gp/your-account/order-history"
+        response = session.get(target_url, headers=headers, timeout=20, allow_redirects=False)
         status_code = response.status_code
-        final_url = response.url
+        final_url = str(response.url)
+        
         if status_code in [301, 302, 303, 307, 308]:
             redirect_location = response.headers.get('Location', '')
-            if '/signin' in redirect_location or '/ap/signin' in redirect_location or 'sign-in' in redirect_location:
+            if '/signin' in redirect_location or '/ap/signin' in redirect_location:
                 return {'status': 'dead','message': 'Cookie DEAD','final_url': redirect_location,'status_code': status_code}
-        elif status_code == 200 and '/gp/your-account/order-history' in final_url:
+        elif status_code == 200:
             return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code}
         else:
             return {'status': 'unknown','message': 'Unexpected response','final_url': final_url,'status_code': status_code}
-    except requests.exceptions.Timeout:
-        return {'status': 'unknown','message': 'Timeout occurred while testing Amazon cookies','final_url': 'N/A','status_code': 'Timeout'}
     except Exception as e:
-        return {'status': 'unknown','message': f'Error testing Amazon login: {str(e)}','final_url': 'N/A','status_code': 'Error'}
+        return {'status': 'error','message': f'Error testing Amazon login: {str(e)}'}
 
 def test_wordpress_login(cookies):
     try:
-        if HAS_CURL_CFFI:
-            session = crequests.Session(impersonate="chrome")
-        else:
-            session = requests.Session()
+        session = crequests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
         for cookie in cookies:
             domain = cookie['domain'].lstrip('.')
             session.cookies.set(cookie['name'], cookie['value'], domain=domain, path=cookie['path'], secure=cookie['secure'])
-        headers = {'User-Agent': CUSTOM_USER_AGENT,'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8','Accept-Language': 'en-US,en;q=0.9','Referer': 'https://wordpress.com/','Connection': 'keep-alive','Upgrade-Insecure-Requests': '1'}
+        
+        headers = {
+            'User-Agent': CUSTOM_USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9'
+        }
         session.headers.update(headers)
+        
         target_url = "https://wordpress.com/me/"
-        response = session.get(target_url, timeout=30, allow_redirects=False)
-        status_code = response.status_code
-        final_url = response.url
-        if status_code in [301, 302, 303, 307, 308]:
-            redirect_location = response.headers.get('Location', '')
-            if '/log-in' in redirect_location or 'login' in redirect_location.lower():
-                return {'status': 'dead','message': 'Cookie DEAD','final_url': redirect_location,'status_code': status_code}
         response = session.get(target_url, timeout=30, allow_redirects=True)
-        final_url = response.url
+        final_url = str(response.url)
         content = response.text
-        authenticated_patterns = [r'data-user-id="(\d+)"',r'"user_id":(\d+)',r'"username":"([^"]+)"',r'"display_name":"([^"]+)"',r'class="[^"]*account[^"]*settings[^"]*"',r'My Sites',r'Account Settings']
-        auth_found = []
-        user_data = {}
+        
+        authenticated_patterns = [
+            r'data-user-id="(\d+)"',
+            r'"user_id":(\d+)',
+            r'"username":"([^"]+)"',
+            r'class="[^"]*account[^"]*settings[^"]*"'
+        ]
+        
+        auth_found = False
         for pattern in authenticated_patterns:
-            matches = re.findall(pattern, content, re.IGNORECASE)
-            if matches:
-                auth_found.append((pattern, matches[0] if isinstance(matches[0], str) else str(matches[0])))
-                if 'user_id' in pattern:
-                    user_data['user_id'] = matches[0]
-                elif 'username' in pattern:
-                    user_data['username'] = matches[0]
-                elif 'display_name' in pattern:
-                    user_data['display_name'] = matches[0]
-        login_prompts = [r'Sign up or log in',r'Log in to WordPress\.com',r'Create your account',r'class="[^"]*login-form[^"]*"',r'id="[^"]*login[^"]*"']
-        login_found = []
+            if re.search(pattern, content, re.IGNORECASE):
+                auth_found = True
+                break
+        
+        login_prompts = [
+            r'Sign up or log in',
+            r'Log in to WordPress\.com',
+            r'class="[^"]*login-form[^"]*"'
+        ]
+        
+        login_found = False
         for pattern in login_prompts:
             if re.search(pattern, content, re.IGNORECASE):
-                login_found.append(pattern)
-        if user_data:
-            return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'user_data': user_data}
-        elif auth_found and not login_found:
-            return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'auth_indicators': len(auth_found)}
+                login_found = True
+                break
+        
+        if auth_found and not login_found:
+            return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': response.status_code}
         elif login_found:
-            return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code,'login_prompts': len(login_found)}
+            return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': response.status_code}
         else:
-            return {'status': 'unknown','message': 'Unclear authentication status','final_url': final_url,'status_code': status_code}
-    except requests.exceptions.Timeout:
-        return {'status': 'unknown','message': 'Timeout occurred while testing WordPress cookies','final_url': 'N/A','status_code': 'Timeout'}
+            return {'status': 'unknown','message': 'Unclear authentication status','final_url': final_url,'status_code': response.status_code}
     except Exception as e:
-        return {'status': 'unknown','message': f'Error testing WordPress login: {str(e)}','final_url': 'N/A','status_code': 'Error'}
+        return {'status': 'error','message': f'Error testing WordPress login: {str(e)}'}
 
 def test_youtube_login(cookies):
     try:
-        session = requests.Session()
+        session = crequests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
         for cookie in cookies:
             domain = cookie['domain'].lstrip('.')
             session.cookies.set(cookie['name'],cookie['value'],domain=domain,path=cookie['path'],secure=cookie['secure'])
-        headers = {'User-Agent': CUSTOM_USER_AGENT,'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8','Accept-Language': 'en-US,en;q=0.9','Referer': 'https://www.youtube.com/','Connection': 'keep-alive','Upgrade-Insecure-Requests': '1'}
+        
+        headers = {
+            'User-Agent': CUSTOM_USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9'
+        }
+        
         target_url = "https://www.youtube.com/account"
-        response = session.get(target_url, headers=headers, timeout=15, allow_redirects=False)
+        response = session.get(target_url, headers=headers, timeout=20, allow_redirects=False)
         status_code = response.status_code
-        final_url = response.url
+        final_url = str(response.url)
+        
         if status_code in [301, 302, 303, 307, 308]:
-            redirect_location = response.headers.get('Location', 'Unknown')
-            return {'status': 'dead','message': 'Cookie DEAD','final_url': redirect_location,'status_code': status_code}
-        elif status_code == 200 and '/account' in final_url:
+            return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code}
+        elif status_code == 200:
             return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code}
         else:
             return {'status': 'unknown','message': 'Unexpected response','final_url': final_url,'status_code': status_code}
-    except requests.exceptions.Timeout:
-        return {'status': 'unknown','message': 'Timeout occurred while testing YouTube cookies','final_url': 'N/A','status_code': 'Timeout'}
     except Exception as e:
-        return {'status': 'unknown','message': f'Error testing YouTube login: {str(e)}','final_url': 'N/A','status_code': 'Error'}
+        return {'status': 'error','message': f'Error testing YouTube login: {str(e)}'}
 
 def test_capcut_login(cookies):
     try:
-        session = requests.Session()
+        session = crequests.Session(impersonate="chrome") if HAS_CURL_CFFI else requests.Session()
         for cookie in cookies:
             domain = cookie['domain'].lstrip('.')
             session.cookies.set(cookie['name'],cookie['value'],domain=domain,path=cookie['path'],secure=cookie['secure'])
-        headers = {'User-Agent': CUSTOM_USER_AGENT,'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8','Accept-Language': 'en-US,en;q=0.9','Referer': 'https://www.capcut.com/','Connection': 'keep-alive','Upgrade-Insecure-Requests': '1'}
-        target_url = "https://www.capcut.com/my-edit?from_page=landing_page&start_tab=video"
-        response = session.get(target_url, headers=headers, timeout=15, allow_redirects=True)
+        
+        headers = {
+            'User-Agent': CUSTOM_USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9'
+        }
+        
+        target_url = "https://www.capcut.com/my-edit"
+        response = session.get(target_url, headers=headers, timeout=20, allow_redirects=True)
         status_code = response.status_code
-        final_url = response.url
+        final_url = str(response.url)
         html_content = response.text
+        
         if final_url == 'https://www.capcut.com' or final_url == 'https://www.capcut.com/':
             return {'status': 'dead','message': 'Cookie DEAD','final_url': final_url,'status_code': status_code}
-        import re
+        
         plan = 'Unknown'
         pattern = r'subscribe_info["\\\s]*:["\\\s]*\{["\\\s]*flag["\\\s]*:["\\\s]*(true|false)'
         match = re.search(pattern, html_content)
         if match:
-            subscribe_flag = match.group(1)
-            plan = 'Pro' if subscribe_flag == 'true' else 'Free'
+            plan = 'Pro' if match.group(1) == 'true' else 'Free'
+        
         if status_code == 200 and ('my-edit' in final_url or '/my-edit' in html_content):
             return {'status': 'success','message': 'Cookie LIVE','final_url': final_url,'status_code': status_code,'plan_info': f'Plan: {plan}'}
         else:
             return {'status': 'unknown','message': 'Unexpected response','final_url': final_url,'status_code': status_code}
-    except requests.exceptions.Timeout:
-        return {'status': 'unknown','message': 'Timeout occurred while testing CapCut cookies','final_url': 'N/A','status_code': 'Timeout'}
     except Exception as e:
-        return {'status': 'unknown','message': f'Error testing CapCut login: {str(e)}','final_url': 'N/A','status_code': 'Error'}
+        return {'status': 'error','message': f'Error testing CapCut login: {str(e)}'}
 
 SCAN_TARGETS = {
-    "netflix": {"url": "https://www.netflix.com/account/membership","contains": "Account","domains": [".netflix.com", "netflix.com", ".netflix.net", "netflix.net"]},
-    "spotify": {"url": "https://www.spotify.com/mx-en/account/subscription/manage/","contains": "Account","domains": [".spotify.com", "spotify.com", ".spotify.net", "spotify.net"]},
-    "tiktok": {"url": "https://www.tiktok.com/setting","contains": "Settings","domains": [".tiktok.com", "tiktok.com", "www.tiktok.com", ".byteoversea.com", "byteoversea.com", ".musical.ly", "musical.ly", ".tiktokcdn.com", "tiktokcdn.com"]},
-    "facebook": {"url": "https://www.facebook.com/settings","contains": "Settings","domains": [".facebook.com", "facebook.com", "www.facebook.com"]},
-    "canva": {"url": "https://www.canva.com/settings/billing-and-teams","contains": "billing","domains": [".canva.com", ".www.canva.com", "www.canva.com", "canva.com"]},
-    "roblox": {"url": "https://www.roblox.com/vi/home","contains": "home","domains": [".roblox.com", "roblox.com", "www.roblox.com"]},
-    "instagram": {"url": "https://www.instagram.com/accounts/edit/","contains": "edit","domains": [".instagram.com", "instagram.com", "www.instagram.com"]},
-    "youtube": {"url": "https://www.youtube.com/account","contains": "account","domains": [".youtube.com", "youtube.com", "www.youtube.com"]},
-    "linkedin": {"url": "https://www.linkedin.com/mypreferences/d/categories/account","contains": "mypreferences","domains": [".linkedin.com", "linkedin.com", "www.linkedin.com", ".www.linkedin.com"]},
-    "amazon": {"url": "https://www.amazon.com/gp/your-account/order-history?ref_=ya_d_c_yo","contains": "order-history","domains": [".amazon.com", "amazon.com", "www.amazon.com"]},
-    "wordpress": {"url": "https://wordpress.com/me/","contains": "me","domains": [".public-api.wordpress.com", ".wordpress.com", "wordpress.com"]},
-    "capcut": {"url": "https://www.capcut.com/profile","contains": "profile","domains": [".capcut.com", "www.capcut.com"]}
+    "netflix": {"url": "https://www.netflix.com/account","contains": "Account","domains": [".netflix.com", "netflix.com"]},
+    "spotify": {"url": "https://www.spotify.com/account/overview/","contains": "Overview","domains": [".spotify.com", "spotify.com"]},
+    "tiktok": {"url": "https://www.tiktok.com/setting","contains": "Settings","domains": [".tiktok.com", "tiktok.com"]},
+    "facebook": {"url": "https://www.facebook.com/settings","contains": "Settings","domains": [".facebook.com", "facebook.com"]},
+    "canva": {"url": "https://www.canva.com/settings/","contains": "Settings","domains": [".canva.com", "canva.com"]},
+    "roblox": {"url": "https://www.roblox.com/home","contains": "Home","domains": [".roblox.com", "roblox.com"]},
+    "instagram": {"url": "https://www.instagram.com/accounts/edit/","contains": "Edit","domains": [".instagram.com", "instagram.com"]},
+    "youtube": {"url": "https://www.youtube.com/account","contains": "Account","domains": [".youtube.com", "youtube.com"]},
+    "linkedin": {"url": "https://www.linkedin.com/mypreferences/d/categories/account","contains": "Preferences","domains": [".linkedin.com", "linkedin.com"]},
+    "amazon": {"url": "https://www.amazon.com/gp/your-account/order-history","contains": "Order","domains": [".amazon.com", "amazon.com"]},
+    "wordpress": {"url": "https://wordpress.com/me/","contains": "Me","domains": [".wordpress.com", "wordpress.com"]},
+    "capcut": {"url": "https://www.capcut.com/my-edit","contains": "My Edit","domains": [".capcut.com", "capcut.com"]}
 }
 
 SERVICE_TEST_FUNCTIONS = {
@@ -1685,6 +1606,10 @@ async def show_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_start_login(update=update)
 
 def main():
+    _fast_print(f"Starting bot with curl_cffi: {HAS_CURL_CFFI}")
+    _fast_print("Make sure to install required packages:")
+    _fast_print("pip install curl-cffi python-telegram-bot requests")
+    
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("menu", menu))
